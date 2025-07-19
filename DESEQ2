@@ -1,0 +1,977 @@
+#load rpy2 magic
+%load_ext rpy2.ipython
+
+# to switch off warning messages
+import warnings
+warnings.filterwarnings("ignore")
+
+# make default cell width 85% of available screen
+from IPython.core.display import display, HTML
+display(HTML("<style>.container { width:85% !important; }</style>"))
+
+# load R libraries & functions
+%R options(warn=-1)
+%R library(RColorBrewer)
+%R library(ComplexHeatmap)
+%R library(circlize)
+%R library(dendextend)
+%R library(Rtsne)
+%R library(ggplot2)
+%R library(gplots)
+%R library(gridExtra)
+%R library(DESeq2)
+%R library(scales)
+%R library(dplyr)
+%R library(dendextend)
+%R library(ggrepel)
+%R library(wesanderson)
+%R library(vsn)
+%R library(reshape2)
+%R library(dplyr)
+%R library(plyr)
+%R library(topGO)
+%R library(stringr)
+
+# supress R warnings/messages
+%R options(warn=-1, echo=FALSE, message=FALSE, results='hide', verbose=FALSE)
+
+# load python modules
+import glob
+import re
+import sys
+import os
+import rpy2.robjects as robjects
+import sqlite3
+import yaml
+import seaborn as sns
+import numpy as np
+import pandas as pd
+from matplotlib import pyplot as plt
+%matplotlib inline
+
+db = "./csvdb"
+
+
+
+# get options pipeline.yml
+import yaml
+with open("pipeline.yml") as o:
+    opts = yaml.load(o)
+#     print(opts)
+
+anndb = opts["annotations"]["database"]
+# print(anndb)
+
+def fetch_DataFrame(query, dbhandle="csvdb"):
+    '''Fetch query results and returns them as a pandas dataframe'''
+
+    dbhandle = sqlite3.connect(dbhandle)
+
+    cc = dbhandle.cursor()
+    sqlresult = cc.execute(query).fetchall()
+    cc.close()
+
+    # see http://pandas.pydata.org/pandas-docs/dev/generated/
+    # pandas.DataFrame.from_records.html#pandas.DataFrame.from_records
+    # this method is design to handle sql_records with proper type
+    # conversion
+
+    field_names = [d[0] for d in cc.description]
+    pandas_DataFrame = pd.DataFrame.from_records(
+        sqlresult,
+        columns=field_names
+    )
+    return pandas_DataFrame
+
+
+%%R
+
+# R functions
+theme_notebook <- function(base_size=18, base_family="helvetica") {
+                  (theme_set(theme_minimal(base_size=18))
+                  + theme(plot.title = element_text(face="bold", size=20, hjust=0.5),
+                             text = element_text(),
+                             axis.title = element_text(face="bold",size = rel(1)),
+                             axis.title.y = element_text(angle=90,vjust=2, size=20),
+                             axis.title.x = element_text(vjust=-0.2, size=20),
+                             axis.text = element_text(size=20),
+                             axis.line = element_line(colour="black"),
+                             axis.ticks = element_line(),
+                             legend.key = element_rect(colour = NA),
+                             legend.key.size= unit(0.5, "cm"),
+                             legend.margin = unit(0.5, "cm"),
+                             legend.text = element_text(size=14),
+                             legend.title = element_text(size=16),
+                             ))
+}
+
+ggplot_prcomp <- function(prcomp_object,
+                          plots=list("A"=c("PC1","PC2"), "B"=c("PC3","PC4"), "C"=c("PC5","PC6")),
+                          sample_information="none",
+                          color="c()",
+                          shape="c()",
+                          label="none",
+                          size=3,
+                          nudge_scale_factor=40){
+    require(gridExtra)
+    pca = prcomp_object
+
+    # sample_information should have the same rownames as pca$x
+    pvs <- summary(pca)$importance["Proportion of Variance",]
+
+    names = paste(names(pvs)," (",round(pvs,2),")",sep="")
+
+    #scree plot
+    fs <- data.frame(x=c(1:length(names(pvs))), y=as.vector(pvs))
+
+    pcdf <- as.data.frame(pca$x)
+
+    pcdf <- merge(pcdf, sample_information, by=0, all=T)
+
+    gps = list()
+
+    scree <- ggplot(fs, aes(x,y)) + 
+                geom_point(size=4) + 
+                xlab("principal component") + 
+                ylab("proportion of variance") + 
+                ggtitle("scree plot") +
+                theme_notebook()
+
+    c_lab <- function(props, C){
+        return(paste(C, " (", props[[C]]*100,"%)",sep=""))
+    }
+
+    for(plot in names(plots)){
+
+        comps <- plots[[plot]]
+
+        PCX <- comps[1]
+        PCY <- comps[2]
+
+        nudge_x <- diff(range(pcdf[[PCX]]))/nudge_scale_factor
+        nudge_y <- diff(range(pcdf[[PCY]]))/nudge_scale_factor
+
+        gp <- ggplot(pcdf, aes_string(PCX, PCY, color=color, shape=shape)) + theme_notebook()
+
+        if(label!="none"){
+            gp <- gp + geom_text(aes_string(label=label), nudge_x=nudge_x, nudge_y=nudge_y, color="black")
+        }
+
+        gp <- gp + geom_point(size=size)
+        gp <- gp + xlab(c_lab(pvs,PCX)) + ylab(c_lab(pvs,PCY))
+
+        gps[[plot]] <- gp
+
+    }
+
+    gps[["scree"]] <- scree
+
+    return(gps)
+}
+
+plot_heatmap <- function(df, sampleinfo, palette, clust_method="ward.D2", dist_method="manhattan", low_opt=0.1, 
+                         med_opt=FALSE, high_opt=0.9, labels="random", no_labels=50, scale_data="other", clust=0, 
+                         order=NULL, scale_colours=c("royalblue3", "white", "red3"), row_clust=TRUE, col_clust=TRUE,
+                         title="", legend_label=FALSE){
+
+     ### complex heatmap plot ###
+    # input: data frame, output: plots heatmap and returns df ordered by dendogram
+        # gene_name must be a column in df!
+    # Optionally can split row dendogram in to up to 10 clusters, which are annotated on returned df
+    
+    require(wesanderson)
+    require(dendextend)
+    require(ComplexHeatmap)
+    require(circlize)
+    require(dplyr)
+    require(plyr)
+    
+    rownames(df) <- NULL # these causes problems with gene labels if not integers
+    
+    # get vector of labels
+    if (labels == "random"){
+        subset <- df[sample(no_labels, replace=FALSE), ]
+        subset <- as.integer(rownames(subset))
+        labels <- df$gene_name[subset]
+        show_rnames <- FALSE
+        lsize <- 12
+    } 
+    
+    # label top variable genes
+    else if (labels == "top_var"){ # get most variable genes at day2
+        subset <- cbind(df)
+        genes <- subset$gene_name # remove labels
+        subset$gene_name <- NULL
+        lsize <- 12
+        subset$var_genes <- apply(subset, 1, sd)# get standard deviation of genes across samples
+        subset$gene_name <- genes
+        subset <- subset[order(subset$var_genes, decreasing=TRUE), ] # order by most variable genes
+        subset <- head(subset, no_labels) # limit to top var genes
+        subset <- as.integer(rownames(subset)) # get index
+        labels <- df[subset, ]$gene_name # subset df by index
+        show_rnames <- FALSE
+    } else if (labels=="all"){
+        show_rnames <- FALSE
+        lsize <- 8
+        subset <- cbind(df) # make a copy
+        subset <- as.integer(rownames(subset)) # get index
+        labels <- df[subset, ]$gene_name # subset df by index
+    }
+    else{
+        print("Specify what to label, options= random, top_var")
+    }
+    
+    rnames <- df$gene_name
+    cnames <- rownames(sampleinfo)
+    df$gene_name <- NULL
+
+    matrix <- data.matrix(df)
+    matrix[is.na(matrix)] <- 0
+    
+    rownames(matrix) <- rnames
+    colnames(matrix) <- cnames
+
+    if (scale_data == "min_max"){
+        # scale each row (gene) manually to min - max of row
+        matrix <- t(apply(matrix, 1, function(x)(x-min(x))/(max(x)-min(x))))
+        legend_name <- "Relative Expression"
+    }
+    else if (scale_data == "z_score") {
+        # z-score each row of matrix
+        matrix <- t(scale(t(matrix)))
+        legend_name <- "Z-Score"
+    }
+    else {
+    #         print("No scaling")
+        legend_name <- "Expression"
+    }
+
+    # Calculate distance
+    if(dist_method == "minkowski"){
+        p=1.44 # If method is "minkowski" set p as 1.44
+        dist_genes <- dist(matrix, method=dist_method, p)
+        }
+    else{
+        dist_genes <- dist(matrix, method=dist_method)
+        }
+
+    # Clustering
+    clust_genes <- hclust(dist_genes, method=clust_method)
+
+    if (clust){
+        # split dendogram in up to 10 clusters and make row annotation bar,
+        # also order matrix by dendogram clustering and annotate with cluster numbers
+        den_genes <- as.dendrogram(clust_genes)
+        den_split <- color_branches(den_genes, k=clust, col=wes_palette("Darjeeling1", type="continuous", n=10)) # colour branches
+
+        # get dendogram order & colours
+        col_labels <- get_leaves_branches_col(den_split)
+        col_labels <- col_labels[order(order.dendrogram(den_split))]
+
+        row_side_bar <- data.frame(col=col_labels)
+        row_side_bar <- data.frame(lapply(row_side_bar, as.character), stringsAsFactors=FALSE)
+
+        # get unique clusters & label them numerically
+        a <- as.data.frame(unique(row_side_bar))
+#         rownames(a) <- seq(length=nrow(a))
+        a$cluster <-  seq(length=nrow(a))
+
+        row_side_bar = plyr::join(row_side_bar, a, type="left") # merge but keep order of clusters
+        row_side_bar$col <- NULL # drop extra col
+        
+    #         clust_matrix <- matrix[den_split$order,] # order matrix as in heatmap
+        clust_matrix <- matrix[clust_genes$labels, ]
+        clust_matrix <- cbind(clust_matrix, cluster=row_side_bar) # add RowSideColor clusters to matrix
+        clust_df <- data.frame(clust_matrix) # convert back to df
+        clust_df <- cbind(clust_df, gene_name=as.character(rownames(clust_matrix))) # get gene names
+
+        # create annotation bar of clusters
+        cluster_pal = c(wes_palette("Royal1"), "lightblue2", "#5BBCD6", "gold", "thistle", "lightgray", "darkseagreen", "skyblue", "indianred")
+        cluster_pal = rep(cluster_pal, 5) # ensure palette is long enough
+        row_side_bar$cluster <- as.character(row_side_bar$cluster)
+        ha2 = HeatmapAnnotation(df=row_side_bar, 
+                                col=list(cluster=c("1"=cluster_pal[[1]], "2"= cluster_pal[[2]], 
+                                                   "3"=cluster_pal[[3]], "4"=cluster_pal[[4]], 
+                                                   "5"=cluster_pal[[5]], "6"=cluster_pal[[6]],
+                                                   "7"=cluster_pal[[7]], "8"=cluster_pal[[8]],
+                                                   "9"=cluster_pal[[9]], "10"=cluster_pal[[10]])), which="row")
+    }
+    else {
+        den_genes <- as.dendrogram(clust_genes)
+        ha2 <- NULL
+        clust_matrix <- matrix
+    }
+
+    if(dist_method == "minkowski"){
+         p=1.44
+         dist_samples <- dist(t(matrix), method=dist_method, p)
+        }
+    else{
+         dist_samples <- dist(t(matrix), method=dist_method)
+        }
+
+    clust_samples <- hclust(dist_samples, method=clust_method)
+    den_samples <- as.dendrogram(clust_samples)
+
+    if (length(order) > 0){
+        # explicitly set optimal order of dendogram
+        den_samples <- den_samples %>% rotate(as.vector(order))
+    }
+    else{
+        den_samples <- den_samples %>% sort(type = "labels") # logically order labels
+    }
+
+    # label selection of genes
+    gene_labels <- rowAnnotation(link=row_anno_link(at=subset, labels=labels), width=unit(1, "cm") + max_text_width(labels))
+
+    # get range for colour palette
+    low <- quantile(matrix, low_opt)[[1]]
+    high <- quantile(matrix, high_opt)[[1]]
+    
+    if (med_opt==FALSE){
+    #             med <- mean(matrix)
+        med <- (high+low)/2
+    } else{
+            med <- quantile(matrix, med_opt)[[1]]
+    }
+    
+    # sample annotation bar
+    names <- unique(sampleinfo$condition)
+    cols <- wes_palette("Moonrise3")[1:length(unique(sampleinfo$condition))]
+    named_vector1 <- setNames(cols, names)
+
+    names2 <- unique(sampleinfo$treatment) 
+    cols2 <- wes_palette("FantasticFox1")[1:length(unique(sampleinfo$treatment))]
+    named_vector2 <- setNames(cols2, names2)
+
+
+#     names3 <- unique(sampleinfo$treatment) 
+#     cols3 <-  wes_palette("IsleofDogs1")[1:length(unique(sampleinfo$group))]
+#     named_vector3 <- setNames(cols3, names3)
+
+#     ha = HeatmapAnnotation(group=sampleinfo$group, condition=sampleinfo$condition, treatment=sampleinfo$treatment, 
+#                            col=list(group=named_vector1, condition=named_vector2, treatment=named_vector3))
+
+    ha = HeatmapAnnotation(condition=sampleinfo$condition, treatment=sampleinfo$treatment,
+                           col=list(condition=named_vector1, treatment=named_vector2))
+
+
+    
+    if (row_clust==FALSE){
+        den_genes <- FALSE
+    }
+
+    if (col_clust==FALSE){
+        den_samples <- FALSE
+    }
+
+    if (legend_label!=FALSE){
+        legend_name = legend_label
+    }
+    
+    ht = Heatmap(matrix, 
+            col = colorRamp2(c(low, med, high), wes_palette("Zissou1", type="continuous", n=3), space="LAB"),
+            name = legend_name,
+            cluster_rows = den_genes,
+            cluster_columns = den_samples,
+            column_dend_reorder = FALSE,
+            row_dend_reorder = FALSE,
+            column_dend_height = unit(1, "cm"),
+            row_dend_width = unit(2, "cm"),
+            show_row_names = show_rnames, 
+            row_names_gp = gpar(fontsize=lsize),
+            show_column_names = FALSE, 
+            heatmap_legend_param=list(legend_direction = "horizontal", 
+                                      color_bar = "continuous",
+                                      legend_width = unit(5, "cm"), 
+                                      title_position = "lefttop"),
+            show_column_dend = TRUE,
+            show_row_dend = TRUE,
+            column_title=title,
+            top_annotation=ha)
+
+    hmap <- draw(ht + ha2 + gene_labels, heatmap_legend_side = "bottom")
+    
+    return(list(hmap, clust_df, den_samples))
+}
+
+SigVstCounts <- function(DESEQ2_results, VSTcounts, gene_info, fdr=0.05, fc=0.58, index="gene_id"){
+    # get VST normalised counts of significantly differentially expressed genes
+    # from DESEQ2 results object
+    
+    # get sig DE genes
+    if (fc != 0){
+        sigvar_genes <- rownames(DESEQ2_results)[DESEQ2_results$padj < fdr 
+                                             & !is.na(DESEQ2_results$padj) 
+                                             & DESEQ2_results$log2FoldChange > fc | 
+                                             DESEQ2_results$padj < fdr 
+                                             & !is.na(DESEQ2_results$padj) 
+                                             & DESEQ2_results$log2FoldChange < -fc] 
+    } else {
+        # don't filter on fold change, 
+        # e.g. if using LRT test where FC isn't reflective of hypothesis tested
+        sigvar_genes <- rownames(DESEQ2_results)[DESEQ2_results$padj < fdr 
+                                             & !is.na(DESEQ2_results$padj)]
+    }
+
+    sigVst <- VSTcounts[sigvar_genes,] # subset VST counts by DE genes
+    sigVst <- as.data.frame(sigVst)
+    
+    # subset counts by geneset (protein coding)
+    sigVst$gene_id <- rownames(sigVst)
+    sigVst <- merge(sigVst, gene_info[c("gene_id", "gene_name")], by="gene_id")
+
+    if (index == "gene_id"){
+        sigVst$gene_name <- NULL
+        rownames(sigVst) <- sigVst$gene_id
+        sigVst$gene_id <- NULL
+    }else if (index=="gene_name"){
+        sigVst$gene_id <- NULL
+        sigVst <- sigVst[!duplicated(sigVst$gene_name), ]
+        rownames(sigVst) <- sigVst$gene_name
+        sigVst$gene_name <- NULL
+    }else{
+        print("specify either gene_id or gene_name for rownames")
+    }
+    
+    
+    print(paste("No. DE genes:", as.character(nrow(sigVst))))
+
+    return(sigVst)   
+}
+
+go_analysis <- function(goi, bg, ontologies=c("BP", "MF", "CC")) {
+    # iterate thorugh list of clusters, getting enriched BP, MF, & BP GO terms for each
+    # store data in df, annotated by ontology and cluster
+
+    clusters <- unique(goi$cluster)
+    
+    x <- 0
+    for (o in ontologies) {
+        x <- x + 1
+        y <- 0
+        for (c in clusters) {
+            y <- y + 1
+
+            clust <- goi[goi$cluster == c, ]$gene_id # get genes in cluster
+            gene_list <- factor(as.integer(bg %in% clust)) # annotate gene universe with goi's from cluster
+            names(gene_list) <- bg # add names to vector
+
+            # create topGO data object
+            GO <- new("topGOdata", ontology = o, allGenes = gene_list, 
+                          annotationFun = annFUN.org, o, mapping="org.Mm.eg.db", ID="ensembl")
+
+            # Fisher's exact test for enrichment of genes in cluster vs background
+            GOres <- runTest(GO, algorithm="classic", statistic="fisher")
+
+            # algorithm = "classic" - GO hierarchy isn't taken into account
+            # try conditional enrichment to control for redundancy (enrichment of parent terms)
+            GOres_weighted <- runTest(GO, algorithm="weight01", statistic="fisher")
+            
+            # extract results for each cluster
+            if (y == 1) {
+                res <- GenTable(GO, weightFisher=GOres_weighted, orderBy="classicFisher", classicFisher=GOres)
+                res$cluster <- c
+                res$ontology <- o
+                res$padj_weightFisher <- p.adjust(res$weightFisher, method="BH")
+                res$padj <- p.adjust(res$classicFisher, method="BH")
+
+                res <- res[order(res$padj), ]
+                
+            } else {
+                df <- GenTable(GO, weightFisher=GOres_weighted, orderBy="classicFisher", classicFisher=GOres)
+                df$cluster <- c
+                df$ontology <- o
+                df$padj_weightFisher <- p.adjust(df$weightFisher, method="BH")
+                df$padj <- p.adjust(df$classicFisher, method="BH")
+
+                df <- df[order(df$padj), ]
+
+                res <- rbind(res, df)
+            }
+
+        }
+        
+    if (x == 1){
+        merge <- res
+    } else {
+        merge <- rbind(merge, res)
+    }
+    
+    }
+    result <- merge[order(merge$cluster), ]
+    
+    return(result)
+}
+
+# Set ggplot theme
+theme_set(theme_notebook(base_size=18))
+
+
+sample_info = fetch_DataFrame('''select * from sample_info''', db)
+sample_info.index = sample_info["sample_id"]
+sample_info.index.name = None
+sample_info.head(len(sample_info))
+
+
+%%R -i sample_info -o Palette
+
+# get pretty colours
+Palette <- wes_palette(sample(names(wes_palettes), 1))
+
+if (length(Palette) < length(unique(sample_info$category))){
+    while (length(Palette) < length(unique(sample_info$category))){
+        pal <- wes_palette(sample(names(wes_palettes), 1))
+        Palette <- unique(c(Palette, pal))
+    }
+}
+
+# get counts
+counts = fetch_DataFrame('''select * from featureCounts''', db)
+cols = [x for x in sample_info["sample_id"]] + ["Geneid"]
+counts = counts[cols]
+counts.rename(columns={"Geneid":"gene_id"}, inplace=True)
+counts.set_index(counts["gene_id"], inplace=True) # set index
+counts.drop("gene_id", axis=1, inplace=True)
+counts.index.name = None
+
+counts.head()
+
+# get gene_ids & gene_names for protein coding genes
+
+statement = '''select distinct b.contig, b.start, b.end, a.gene_id, 
+            a.gene_name from gene_info a, geneset_all_gtf_genome_coordinates 
+            b where a.gene_id = b.gene_id and transcript_biotype = "protein_coding"''' 
+
+gene_info = fetch_DataFrame(statement, anndb)
+
+# gene_info.head()
+
+
+DESeq2 Analysis
+DESeq2 analysis design is indicated by design column in sample information table
+Variance stabilised (VST) counts of all differentially expressed (LRT test, padj < 0.05) genes are used for PCA, tSNE, and heatmap
+Plots:
+standard deviation for VST transformed data vs mean (across samples)
+dispersion estimate plot
+
+
+%%R -i counts,sample_info -w 600
+
+# define a data frame with information about the samples (i.e the columns of the countData)
+rownames(sample_info) <- sample_info$sample_id
+sample_info$sample_id <- NULL
+
+# reorder the columnData to match the count matrix:
+sample_info <- sample_info[colnames(counts),]
+
+# build a DESeqDataSet from the count matrix
+dds <- DESeqDataSetFromMatrix(countData=counts, 
+                              colData=sample_info, 
+                              design= ~ category )
+
+dds <- estimateSizeFactors(dds)
+
+# apply VST
+vstMat <- assay(varianceStabilizingTransformation(dds, blind=TRUE, fitType="local")) 
+colnames(vstMat) <- rownames(sample_info)
+notAllZero <- (rowMeans(vstMat)> min(vstMat))
+
+meanSdPlot(vstMat[notAllZero,], ylab="sd, vst",plot=T) 
+
+# run DESeq2
+dds <- DESeq(dds,  fitType="local") # have check both and local provides best fit
+dds_lrt <- DESeq(dds,  fitType="local", test="LRT", reduced=~1)
+
+res_lrt <- results(dds_lrt)
+res <- results(dds)
+
+plotDispEsts(dds) # check dispersion estimate fit
+
+
+
+%%R -w 1200 -h 400
+
+# DESeq function calculates Cooks distance (diagnostic test for outliers) for every gene and sample. 
+# Cooks distance is a measure of how much a single sample is influencing fitted coefficients for a gene, large values indicate an outlier count
+# results function automatically flags genes with high Cooks values for samples w/ >3 replicates. P & padj values for these genes are set to NA
+# Filtering on genes by Cooks distance can be turned off with results(dds, cooksCutoff=FALSE)
+
+cooks <- melt(as.data.frame(log10(assays(dds)[["cooks"]])))
+cooks <- merge(cooks, sample_info, by.x="variable", by.y=0, all=T)
+
+p1 <- ggplot(cooks, aes(y=value, x=variable, fill=category)) +  
+        geom_boxplot(colour="black")  + 
+        labs(y="Cooks Distance (log10)", x="") +
+        scale_fill_manual(values=Palette) +
+        theme_notebook() +
+#         theme(axis.text.x=element_text(angle=45, hjust=1)) +
+        theme(axis.text.x=element_blank()) +
+        geom_hline(lty="dashed", col="black", yintercept=mean(cooks$value, na.rm=T))
+
+p1
+
+%%R -w 1200 -h 600 -o filt_norm_counts
+
+# raw counts
+raw <- melt(t(counts(dds)))
+raw <- merge(raw, sample_info, by.x="Var1", by.y=0, all=T)
+p1 <- ggplot(raw, aes(y=log2(value), x=Var1, fill=category)) + 
+        geom_boxplot(colour="black") + 
+        theme_notebook() +
+        theme(axis.text.x=element_blank()) +
+        labs(title="Raw counts", y="log2(counts)", x="") + 
+        scale_fill_manual(values=Palette) 
+
+
+
+# norm counts = counts(dds) / sizeFactors(dds)
+norm <- melt(t(counts(dds,normalized=T)))
+norm <- merge(norm, sample_info, by.x="Var1", by.y=0, all=T)
+p2 <- ggplot(norm, aes(y=log2(value), x=Var1, fill=category)) + 
+        geom_boxplot(colour="black") + 
+        theme_notebook() +
+        theme(axis.text.x=element_blank()) +
+        labs(title="Normalised counts", y="", x="") + 
+        scale_fill_manual(values=Palette)
+
+
+
+# VST counts
+colnames(vstMat) <- dds@colData@rownames
+data <-melt(vstMat[notAllZero,])
+data <- merge(data, sample_info, by.x="Var2", by.y=0, all=T)
+
+p3 <- ggplot(data, aes(y=value, x=Var2, fill=category)) + 
+        geom_boxplot(colour="black")  + 
+        theme_notebook() +
+        theme(axis.text.x=element_blank()) +
+        labs(title="VST counts", y="", x="") + 
+        scale_fill_manual(values=Palette) 
+
+# normalised counts with excluded counts (padj == NA) removed
+# counts excluded by: Cooks cutoff & independent filtering
+filtered_genes <- subset(res, res@listData$padj != "NA")@"rownames" # get sig DE gene names
+filt_norm_counts <- subset(melt(t(counts(dds,normalized=T))), Var2 %in% filtered_genes)
+filt_norm_counts_info <- merge(filt_norm_counts, sample_info, by.x="Var1", by.y=0, all=T)
+
+p4 <- ggplot(filt_norm_counts_info, aes(y=log2(value), x=Var1, fill=category)) + 
+        geom_boxplot(colour="black") + 
+        theme_notebook() +
+        theme(axis.text.x=element_blank()) +
+        labs(title="Filt. normalised counts", y="log2(counts)", x="") + 
+        scale_fill_manual(values=Palette) 
+
+get_legend <- function(a.gplot){ 
+  tmp <- ggplot_gtable(ggplot_build(a.gplot)) 
+  leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box") 
+  legend <- tmp$grobs[[leg]] 
+  return(legend)}
+                      
+key <- get_legend(p4 + theme(legend.direction="horizontal"))
+
+grid.arrange(p1 + theme(legend.position="none"), 
+             p2 + theme(legend.position="none"), 
+             p4 + theme(legend.position="none"), 
+             p3 + theme(legend.position="none"), bottom=key, ncol=2, nrow=2)
+
+
+# rearrange data -> by gene
+filt_norm_counts = filt_norm_counts.pivot("Var2", "Var1", "value")
+filt_norm_counts.index.name = None
+# filt_norm_counts.head()
+
+%%R -w 1200 -h 600 -i filt_norm_counts
+
+# relative log2 expression
+# Relative Log Expression” (RLE) is implemented in edgeR and DESeq packages - normalises samples for size factors
+# good description of procedure here: http://www.nathalievilla.org/doc/pdf/tutorial-rnaseq.pdf
+# Briefly, the gene expression in each sample is normalised to the median expression of that gene across all samples & counts are log2 transformed
+# RLE should be centered over 0, dispersion from this indicates poor quality normalisation
+
+# raw counts
+rawc <- apply(counts(dds),1,median)
+rle_raw <- log2(counts(dds)/rawc)
+rlem_raw <- melt(t(rle_raw))
+rlem_raw <- merge(rlem_raw, sample_info, by.x="Var1", by.y=0, all=T)
+# head(rlem_raw)
+
+rle_raw_bp <- ggplot(rlem_raw, aes(y=value, x=Var1, fill=category)) + geom_boxplot(colour="black") + 
+                theme_notebook() +
+                theme(axis.text.x=element_blank()) + 
+                geom_hline(yintercept=0, lty="dashed", colour="black") +
+                labs(title="Raw counts", y="Relative Log Expression", x="") +
+                scale_fill_manual(values=c(Palette)) 
+
+
+# norm counts
+normc <- apply(counts(dds, normalized=TRUE),1,median)
+rle_norm <- log2(counts(dds, normalized=TRUE)/normc)
+rlem_norm <- melt(t(rle_norm))
+rlem_norm <- merge(rlem_norm, sample_info, by.x="Var1", by.y=0, all=T)
+# head(rlem_norm)
+
+rle_norm_bp <- ggplot(rlem_norm, aes(y=value, x=Var1, fill=category)) + geom_boxplot(colour="black") + 
+                theme_notebook() +
+                theme(axis.text.x=element_blank()) + 
+                geom_hline(yintercept=0, lty="dashed", colour="black") +
+                labs(title="Normalised counts", y="", x="") +
+                scale_fill_manual(values=c(Palette))
+
+# Norm counts with filtering (Cooks distance, independent filtering)
+filtc <- apply(filt_norm_counts,1,median)
+rle_filt <- log2(filt_norm_counts/filtc)
+rlem_filt <- melt(t(rle_filt))
+rlem_filt <- merge(rlem_filt, sample_info, by.x="Var1", by.y=0, all=T)
+# head(rlem_filt)
+
+rle_filt_bp <- ggplot(rlem_filt, aes(y=value, x=Var1, fill=category)) + geom_boxplot(colour="black") + 
+                theme_notebook() +
+                theme(axis.text.x=element_blank()) + 
+                geom_hline(yintercept=0, lty="dashed", colour="black") +
+                labs(title="Filt. normalised counts", y="Relative Log Expression", x="") +
+                scale_fill_manual(values=c(Palette)) 
+
+# VST counts
+vstc <- apply(vstMat,1,median)
+rle_vst <- log2(vstMat/vstc)
+rlem_vst <- melt(t(rle_vst))
+rlem_vst <- merge(rlem_vst, sample_info, by.x="Var1", by.y=0, all=T)
+
+rle_vst_bp <- ggplot(rlem_vst, aes(y=value, x=Var1, colour=category)) + geom_boxplot() + 
+                theme_notebook() +
+                theme(axis.text.x=element_blank()) + 
+                geom_hline(yintercept=0, lty="dashed", colour="black") +
+                labs(title="VST counts", y="", x="") +
+                scale_colour_manual(values=c(Palette)) 
+
+key <- get_legend(rle_raw_bp + theme(legend.direction="horizontal"))
+
+grid.arrange(rle_raw_bp + theme(legend.position="none"), 
+             rle_norm_bp + theme(legend.position="none"), 
+             rle_filt_bp + theme(legend.position="none"), 
+             rle_vst_bp + theme(legend.position="none"), ncol=2, nrow=2, bottom=key)
+
+%%R -o sigVst,vstDF -i sample_info,gene_info
+
+sigVst <- SigVstCounts(res_lrt, vstMat, gene_info, fdr=0.05, fc=0)
+
+# also export all counts to df
+vstDF <- as.data.frame(vstMat)
+vstDF$gene_id <- rownames(vstMat)
+
+%%R -w 1200 -h 450
+                      
+pca <- prcomp(t(sigVst), scale=FALSE)
+
+pca_plots <- ggplot_prcomp(pca, 
+             plots=list("A"=c("PC1","PC2"), "B"=c("PC3", "PC4")),
+             sample_information=sample_info, 
+             color="condition",
+             label="replicate",
+             shape="treatment",
+             size=6,
+             nudge_scale_factor=30) 
+
+a <- pca_plots$A
+b <- pca_plots$B
+c <- pca_plots$scree
+
+a = a + scale_colour_manual(values=Palette) +
+        guides(colour=guide_legend(override.aes=list(size=8)), shape=guide_legend(override.aes=list(size=8)))
+               
+b = b + scale_colour_manual(values=Palette) 
+
+c = c 
+
+get_legend <- function(a.gplot){ 
+tmp <- ggplot_gtable(ggplot_build(a.gplot)) 
+leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box") 
+legend <- tmp$grobs[[leg]] 
+return(legend)}
+
+a <- a + theme(legend.direction="horizontal", legend.box="horizontal")
+legend <- get_legend(a)
+                      
+grid.arrange(top=textGrob("PCA of VST Counts at Differentially Accessible Peaks", 
+                          gp=gpar(fontface="bold", fontfamily="Helvetica", fontsize=23)),
+             a + theme(legend.position="none"), b + theme(legend.position="none"), c, 
+             bottom=legend, ncol=3, nrow=1)
+
+%%R -w 450 -h 400
+
+library(Rtsne)
+tsne_out = Rtsne(t(sigVst), pca=T, perplexity=3)
+
+tsne_df <- as.data.frame(tsne_out$Y)
+rownames(tsne_df) <- colnames(t(sample_info))
+colnames(tsne_df) <- c("tSNE1", "tSNE2")
+
+tsne_df <- merge(tsne_df, sample_info, by=0)
+
+tsne_plot <- ggplot(tsne_df, aes(y=tSNE1, x=tSNE2, colour=category, shape=factor(replicate))) + 
+                    geom_point(size=6) + 
+                    theme_notebook() +
+                    scale_colour_manual(values=Palette) +
+                    scale_shape_manual(values=c(16,17,22,23,25),name="replicate")
+
+grid.arrange(top=textGrob("tSNE of VST Counts at \nDifferentially Accessible Peaks", 
+             gp=gpar(fontface="bold", fontfamily="Helvetica", fontsize=18)), 
+             tsne_plot, ncol=1, nrow=1)
+
+def upload2csvdb(df, tablename, db):
+    '''upload df to sqlite db'''
+    
+    connect = sqlite3.connect(db)
+    
+    df.to_sql(tablename, connect, if_exists="replace", index=False)
+    
+
+upload2csvdb(sigVst, "DESeq2_LRT_all_samples", "./csvdb")
+upload2csvdb(vstDF, "VST_counts", "./csvdb")
+
+%%R -w 500 -h 500
+
+cm <- data.matrix(sigVst)
+m <- cor(cm, method="pearson", use="all")
+
+distr <- dist(m, method="manhattan")
+clustr <- hclust(distr, method="ward.D2")
+dendr <- as.dendrogram(clustr)
+dendr <- dendr %>% sort(type="labels")
+
+distc <- dist(t(m), method="manhattan")
+clustc <- hclust(distc, method="ward.D2")
+dendc <- as.dendrogram(clustc)
+dendc <- rev(dendc) %>% sort(type="labels")
+
+p2 <- Heatmap(m,
+#        split=4,
+       col = colorRamp2(c(min(m), median(m), max(m)), wes_palette("Zissou1", type="continuous", n=3)),
+       cluster_rows=dendr,
+       cluster_columns=dendc,
+       column_dend_reorder = FALSE,
+       row_dend_reorder = FALSE,
+       column_dend_height = unit(2, "cm"),
+       row_dend_width = unit(2, "cm"),
+       row_names_gp=gpar(fontsize=12),
+       column_names_gp=gpar(fontsize=12),
+       name="Pearson Correlation:",
+       heatmap_legend_param=list(legend_direction="horizontal", 
+#                                   at=c(0.9, 1), 
+                                  color_bar = "continuous",
+                                  legend_width = unit(5, "cm"), 
+                                  title_position = "lefttop",
+                                  title_gp=gpar(fontsize=14),
+                                  labels_gp=gpar(fontsize=14)),
+       )
+
+draw(p2, heatmap_legend_side = "bottom")
+
+
+%%R -h 600 -w 500
+
+# get significat LRT genes in format for heatmap
+sigVst <- SigVstCounts(res_lrt, vstMat, gene_info, fdr=0.05, fc=0, index="gene_name")
+sigVst$gene_name <- rownames(sigVst)
+
+# head(sigVst)
+hmap <- plot_heatmap(sigVst, sample_info, Palette, scale_data="none", label="top_var", clust=6)
+
+%%R -h 600 -w 500
+
+hmap <- plot_heatmap(sigVst, sample_info, Palette, scale_data="min_max", label="top_var", clust=6)
+
+
+# get gene background, all expressed genes
+bg = counts.copy(deep=True)
+
+# get gene names
+bg["gene_id"] = counts.index.values
+bg = pd.merge(bg, gene_info[["gene_id", "gene_name"]], how="inner", on="gene_id")
+
+bg.set_index("gene_id", inplace=True, drop=True)
+bg.drop("gene_name", axis=1, inplace=True)
+bg.index.name = None #(inplace=True)
+
+# subset to detected genes
+# print(len(bg))
+bg = bg[(bg != 0).any(axis=1)]
+
+# gene ids only
+bg = bg.index.values
+
+# len(bg)
+
+%%R
+
+# get genes of interest
+goi <- hmap[[2]]
+goi <- merge(goi[, c("gene_name", "cluster")], gene_info[, c("gene_id", "gene_name")], how="inner", by="gene_name")
+
+# head(goi)
+
+%%R -i bg
+
+go <- go_analysis(goi, bg)
+
+%%R
+
+saveRDS(go, file="LRT_heatmap_clusters_GO.rds")
+# go <- readRDS("LRT_heatmap_clusters_GO.rds")
+
+
+%%R -h 800 -w 1200
+
+library(stringr)
+plot_go <- function(df, pval=0.1, top=10, title=""){
+    df$Fold <- df$Significant / df$Expected
+
+    df <- subset(df, padj < pval)
+        
+    n <- 0
+    for (c in unique(df$cluster)){
+        n <- n +1
+        cat <- subset(df, cluster == c)
+        cat <- cat[order(cat$padj, decreasing=FALSE),  ]
+        cat <- head(cat, top)
+        
+        if (n==1){
+            res <- cat
+        } else {
+            res <- rbind(res, cat)
+        }
+    }
+    
+    res <- res[order(res$cluster), ]
+
+    clust_pal <- c(wes_palette("Royal1"), "lightblue2", "#5BBCD6", "gold", "thistle", "lightgray", "darkseagreen", "skyblue", "indianred")
+
+    p1 <- ggplot(res, aes(y=Fold, x=Term, fill=as.factor(cluster), alpha=-log10(padj))) + 
+            geom_bar(stat="identity", position="dodge", colour="black") + 
+            geom_text(aes(label=Significant, y=Fold+0.2,), colour="black", position=position_dodge(width=1), alpha=1, size=4) +
+#             geom_text(aes(label=GO.ID, y=Fold/2,), colour="black", position=position_dodge(width=1), alpha=1, size=4) +
+            scale_x_discrete(limits=unique(res$Term), labels=str_wrap(unique(res$Term), 50)) +
+            scale_fill_manual(values=clust_pal, name="Cluster") +
+            scale_alpha(range=c(0.4, 1), name="-log10(FDR)") +
+            coord_flip() +
+            labs(x="", title=paste("Ontology:", title)) +
+            theme_notebook() +
+            theme(legend.box="vertical") +
+            geom_hline(yintercept=1, lty="dashed") 
+    
+    
+    return(p1)
+}
+
+for (o in unique(go$ontology)){
+    p1 <- plot_go(subset(go, ontology==o), top=5, title=o)
+    grid.arrange(p1, ncol=1, nrow=1)
+}
+
+
+DE Peaks - Contrasts
+Pairwise comparisons of differentially accessible peaks
+Adjusted p-value < 0.05 & fold change > 2
+DESeq2 contrasts:
+Fold changes reported are relative to "a"
